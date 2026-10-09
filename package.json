@@ -1,0 +1,15 @@
+{
+  "name": "gpn-server",
+  "version": "0.1.0",
+  "description": "GPN VPS server — receives game targets from clients, manages WireGuard peers + routing",
+  "module": "src/main.ts",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/main.ts",
+    "build:linux": "bun build src/main.ts --compile --target=bun-linux-x64 --outfile dist/gpn-server"
+  },
+  "devDependencies": {
+    "bun-types": "latest",
+    "@types/bun": "latest"
+  }
+}
