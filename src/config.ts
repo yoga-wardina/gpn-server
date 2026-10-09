@@ -8,6 +8,8 @@ export interface Config {
   port: number;
   /** WireGuard interface */
   wgInterface: string;
+  /** Public endpoint clients should connect to (ip or hostname) */
+  publicEndpoint?: string;
   /** WireGuard server private key file */
   wgPrivateKeyFile: string;
   /** WG subnet clients are drawn from */

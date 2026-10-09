@@ -84,11 +84,14 @@ async function handle(req: Request): Promise<Response> {
       console.log(`[gpn-server] registered peer ${name ?? "?"} -> ${ip}`);
     }
     const serverPub = readFileSync("/etc/wireguard/server.pub", "utf8").trim();
+    // Use a public IP for the WG endpoint — never the Host header (may be a
+    // domain without DNS, or localhost behind Caddy). Configurable via config.
+    const endpoint = `${cfg.publicEndpoint ?? "43.134.108.20"}:51820`;
     return json({
       ok: true,
       ip: peer.ip,
       serverPublicKey: serverPub,
-      endpoint: `${new URL(req.url).hostname}:51820`,
+      endpoint,
       subnet: cfg.wgSubnet,
     });
   }
