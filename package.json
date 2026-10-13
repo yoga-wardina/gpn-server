@@ -11,5 +11,9 @@
   "devDependencies": {
     "bun-types": "latest",
     "@types/bun": "latest"
+  },
+  "dependencies": {
+    "ioredis": "^6.0.0",
+    "pg": "^8.23.1"
   }
 }

@@ -19,6 +19,10 @@ export interface Config {
   mode: "client" | "route";
   /** Target expiry: drop client IPs not refreshed within this many ms */
   targetTtlMs: number;
+  /** Postgres (user accounts) */
+  db?: { host?: string; port?: number; name?: string; user?: string; password?: string };
+  /** Redis (auth token cache) */
+  redis?: { host?: string; port?: number };
 }
 
 export const DEFAULT_CONFIG: Config = {
