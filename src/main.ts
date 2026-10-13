@@ -52,9 +52,11 @@ async function initDb() {
       username TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'user',
+      status TEXT NOT NULL DEFAULT 'active',
       created_at TIMESTAMPTZ DEFAULT now(),
       last_login TIMESTAMPTZ
     )`);
+  await pg.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'`);
   const { rows } = await pg.query("SELECT count(*)::int AS n FROM users");
   if (rows[0].n === 0) {
     const pw = randomBytes(12).toString("hex");
@@ -191,16 +193,18 @@ async function handle(req: Request): Promise<Response> {
 
   if (url.pathname === "/api/auth/login" && req.method === "POST") {
     const { username, password } = await req.json();
-    const { rows } = await pg.query("SELECT id, password_hash, role FROM users WHERE username = $1", [
+    const { rows } = await pg.query("SELECT id, password_hash, role, status FROM users WHERE username = $1", [
       (username ?? "").toLowerCase(),
     ]);
     if (!rows.length || !verifyPassword(password ?? "", rows[0].password_hash))
       return json({ error: "invalid credentials" }, 401);
+    if (rows[0].status !== "active")
+      return json({ error: "account is inactive — contact an admin" }, 403);
     await pg.query("UPDATE users SET last_login = now() WHERE id = $1", [rows[0].id]);
     const tokens = await issueTokens(rows[0].id);
     return json({
       ok: true,
-      user: { id: rows[0].id, username: (username ?? "").toLowerCase(), role: rows[0].role },
+      user: { id: rows[0].id, username: (username ?? "").toLowerCase(), role: rows[0].role, status: rows[0].status },
       ...tokens,
     });
   }
@@ -209,6 +213,11 @@ async function handle(req: Request): Promise<Response> {
     const { refreshToken } = await req.json();
     const uid = await redis.get(`gpn:auth:refresh:${refreshToken ?? ""}`);
     if (!uid) return json({ error: "invalid refresh token" }, 401);
+    const { rows } = await pg.query("SELECT status FROM users WHERE id = $1", [parseInt(uid, 10)]);
+    if (!rows.length || rows[0].status !== "active") {
+      await redis.del(`gpn:auth:refresh:${refreshToken}`);
+      return json({ error: "account is inactive — contact an admin" }, 403);
+    }
     await redis.del(`gpn:auth:refresh:${refreshToken}`);
     const tokens = await issueTokens(parseInt(uid, 10));
     return json({ ok: true, ...tokens });
@@ -226,8 +235,40 @@ async function handle(req: Request): Promise<Response> {
 
   if (url.pathname === "/api/auth/me") {
     if (auth.uid === null) return json({ user: { username: "machine", role: "admin" } });
-    const { rows } = await pg.query("SELECT id, username, role, created_at, last_login FROM users WHERE id = $1", [auth.uid]);
-    return json({ user: rows[0] ?? null });
+    const { rows } = await pg.query("SELECT id, username, role, status, created_at, last_login FROM users WHERE id = $1", [auth.uid]);
+    if (!rows.length || rows[0].status !== "active") return json({ error: "account inactive" }, 403);
+    return json({ user: rows[0] });
+  }
+
+  // ---------- admin: user management ----------
+  if (url.pathname.startsWith("/api/admin/users") && auth.role !== "admin") {
+    return json({ error: "admin only" }, 403);
+  }
+
+  if (url.pathname === "/api/admin/users" && req.method === "GET") {
+    const { rows } = await pg.query("SELECT id, username, role, status, created_at, last_login FROM users ORDER BY id");
+    return json({ users: rows });
+  }
+
+  // POST /api/admin/users/status  {userId, status: 'active'|'inactive'}
+  if (url.pathname === "/api/admin/users/status" && req.method === "POST") {
+    const { userId, status } = await req.json();
+    if (!["active", "inactive"].includes(status)) return json({ error: "status must be active|inactive" }, 400);
+    const { rows } = await pg.query("UPDATE users SET status = $1 WHERE id = $2 RETURNING id, username, status", [status, userId]);
+    if (!rows.length) return json({ error: "user not found" }, 404);
+    // kicking a just-deactivated user: revoke their tokens
+    if (status === "inactive") {
+      const keys = await redis.keys("gpn:auth:token:*");
+      for (const k of keys) {
+        if ((await redis.get(k)) === String(userId)) await redis.del(k);
+      }
+      const rkeys = await redis.keys("gpn:auth:refresh:*");
+      for (const k of rkeys) {
+        if ((await redis.get(k)) === String(userId)) await redis.del(k);
+      }
+    }
+    console.log(`[gpn-server] admin set user ${rows[0].username} -> ${status}`);
+    return json({ ok: true, user: rows[0] });
   }
 
   if (url.pathname === "/api/register" && req.method === "POST") {
