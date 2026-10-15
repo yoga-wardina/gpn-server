@@ -1,7 +1,7 @@
 /**
  * WireGuard management — peer CRUD via `wg` command + IP allocation.
- * Also: dynamic routing so only game-target IPs from a client egress via that
- * client's tunnel (policy routing with per-client nftables sets).
+ * All mutating operations are serialized through withLock() so concurrent
+ * requests can't lose allowed-ips updates or allocate the same VPN IP.
  */
 import { run } from "./proc.ts";
 
@@ -9,77 +9,90 @@ export interface Peer {
   publicKey: string;
   ip: string; // WG vpn ip, e.g. 10.66.0.2
   name: string; // client-chosen label
-  allowedGameTargets: string[]; // game ips currently routed for this client
+  owner: number | null; // user id; null = machine token / restored (claimable)
+  allowedGameTargets: string[]; // game ips currently in this peer's allowed-ips
   lastSeen: number;
   createdAt: number;
 }
 
+export interface WgPeerInfo {
+  ip: string; // the peer's own /32 (first allowed-ip)
+  targets: string[]; // remaining allowed-ips (game targets)
+  latestHandshake: number; // unix seconds, 0 = never
+}
+
+const IPV4 = /^(\d{1,3}\.){3}\d{1,3}$/;
+
 export class WgManager {
+  private queue: Promise<unknown> = Promise.resolve();
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
+
   constructor(
     private iface: string,
     private subnet: string
   ) {}
 
-  async listPeers(): Promise<Map<string, { ip: string; handshakeAgo: number }>> {
+  /** Run fn after all previously queued WG operations finish. */
+  withLock<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.queue.then(fn, fn);
+    this.queue = next.catch(() => {});
+    return next;
+  }
+
+  async listPeers(): Promise<Map<string, WgPeerInfo>> {
     const out = await run("sudo", ["wg", "show", this.iface, "dump"]);
-    const map = new Map();
-    // dump format: line0 = server; peer lines: pub, pre, pres, endpoint, allowed-ips, handshake(0=none), rx, tx, keepalive
+    const map = new Map<string, WgPeerInfo>();
+    // dump format: line0 = server; peer lines: pub, psk, endpoint, allowed-ips, handshake(unix, 0=none), rx, tx, keepalive
     for (const line of out.trim().split("\n").slice(1)) {
       const parts = line.split("\t");
       if (parts.length < 6) continue;
-      const [pub, , , , allowed, handshake] = parts;
-      // allowed-ips may be "10.66.0.2/32" or "10.66.0.2/32,1.2.3.4/32" — take first v4 /32
-      const first = allowed.split(",")[0]?.split("/")[0] ?? "";
-      const ip = /^(\d{1,3}\.){3}\d{1,3}$/.test(first) ? first : "";
-      map.set(pub, { ip, handshakeAgo: parseInt(handshake, 10) || 0 });
+      const [pub, , , allowed, handshake] = parts;
+      const ips = (allowed ?? "")
+        .split(",")
+        .map((s) => s.split("/")[0]!.trim())
+        .filter((s) => IPV4.test(s));
+      map.set(pub!, {
+        ip: ips[0] ?? "",
+        targets: ips.slice(1),
+        latestHandshake: parseInt(handshake ?? "0", 10) || 0,
+      });
     }
     return map;
   }
 
+  /** Caller must hold the lock. */
   async addPeer(publicKey: string, ip: string): Promise<void> {
     await run("sudo", ["wg", "set", this.iface, "peer", publicKey, "allowed-ips", `${ip}/32`]);
-    await run("sudo", ["wg-quick", "save", this.iface]);
+    this.scheduleSave();
   }
 
+  /** Caller must hold the lock. */
   async removePeer(publicKey: string): Promise<void> {
     await run("sudo", ["wg", "set", this.iface, "peer", publicKey, "remove"]);
-    await run("sudo", ["wg-quick", "save", this.iface]);
+    this.scheduleSave();
   }
 
-  /** Route a game target IP so packets from this peer's tunnel go to it via WG.
-   *  With allowed-ips per-peer this only affects traffic arriving from that peer. */
-  async addTargetForPeer(publicKey: string, ip: string): Promise<void> {
-    const peers = await this.listPeers();
-    const existing = peers.get(publicKey);
-    if (!existing) throw new Error("peer not found");
-    // update allowed-ips = existing ip/32 + game targets
-    const current = await this.getPeerAllowedIps(publicKey);
-    if (current.includes(`${ip}/32`) || current.includes(ip)) return;
-    const ips = [...current, `${ip}/32`];
+  /** Replace a peer's allowed-ips with its own /32 plus the given targets in ONE wg call.
+   *  Deliberately does not `wg-quick save`: targets are transient and must not be persisted. */
+  async setPeerTargets(publicKey: string, peerIp: string, targets: string[]): Promise<void> {
+    const ips = [`${peerIp}/32`, ...targets.map((t) => `${t}/32`)];
     await run("sudo", ["wg", "set", this.iface, "peer", publicKey, "allowed-ips", ips.join(",")]);
-    await run("sudo", ["wg-quick", "save", this.iface]);
   }
 
-  async removeTargetForPeer(publicKey: string, ip: string): Promise<void> {
-    const current = await this.getPeerAllowedIps(publicKey);
-    const ips = current.filter((x) => x !== `${ip}/32` && x !== ip);
-    await run("sudo", ["wg", "set", this.iface, "peer", publicKey, "allowed-ips", ips.join(",")]);
-    await run("sudo", ["wg-quick", "save", this.iface]);
+  /** Debounced `wg-quick save` (peer membership changes only). */
+  private scheduleSave() {
+    if (this.saveTimer) return;
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null;
+      this.withLock(() => run("sudo", ["wg-quick", "save", this.iface])).catch((e) =>
+        console.error("[gpn-server] wg-quick save failed:", e)
+      );
+    }, 2000);
   }
 
-  private async getPeerAllowedIps(publicKey: string): Promise<string[]> {
-    const out = await run("sudo", ["wg", "show", this.iface, "allowed-ips"]);
-    for (const line of out.split("\n")) {
-      if (line.startsWith(publicKey)) {
-        // `wg show allowed-ips` separates entries with a SPACE (not comma)
-        return line.split("\t")[1]?.split(/\s+/).map((s) => s.trim()).filter(Boolean) ?? [];
-      }
-    }
-    return [];
-  }
-
-  /** Next free client IP in the subnet (10.66.0.2, .3, ...). */
-  async allocateIp(used: Set<string>): Promise<string> {
+  /** Next free client IP in the subnet (10.66.0.2, .3, ...). Synchronous so
+   *  allocation + reservation can't interleave with another request. */
+  allocateIp(used: Set<string>): string {
     const base = this.subnet.replace(/\.0\/\d+$/, "");
     for (let i = 2; i < 255; i++) {
       const candidate = `${base}.${i}`;
