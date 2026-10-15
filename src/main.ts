@@ -23,6 +23,7 @@ import { join } from "node:path";
 import { randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { loadConfig, type Config } from "./config.ts";
 import { WgManager, type Peer } from "./wireguard.ts";
+import { ProbeManager } from "./probe.ts";
 import { Pool } from "pg";
 import Redis from "ioredis";
 
@@ -50,6 +51,7 @@ redis.on("error", (e: Error) => console.error("[gpn-server] redis error:", e.mes
 
 const wg = new WgManager(cfg.wgInterface, cfg.wgSubnet);
 const peers = new Map<string, Peer>(); // publicKey -> Peer
+const probes = new ProbeManager(); // latency/loss from this server to clients' game servers
 const usedIps = new Set<string>();
 
 class HttpError extends Error {
@@ -480,6 +482,31 @@ async function handle(req: Request, ip: string): Promise<Response> {
     return json({ ok: true, routed: next, ...result, rejected });
   }
 
+  // Latency / packet loss from THIS server to the caller's game servers (the "VPS -> game" leg).
+  //   POST {targets:[{ip, port?}]}  declare what to measure (must already be on the peer's target list)
+  //   GET                           current results for the caller's peer
+  if (path === "/api/probe" && (req.method === "POST" || req.method === "GET")) {
+    const clientPub = req.headers.get("x-gpn-peer");
+    if (!clientPub) return json({ error: "x-gpn-peer header required (your wireguard public key)" }, 400);
+    const peer = peers.get(clientPub);
+    if (!peer) throw new HttpError(404, "unknown peer — register first");
+    if (!canAccess(auth, peer)) throw new HttpError(403, "not your peer");
+    if (req.method === "GET") return json({ results: probes.results(clientPub) });
+
+    rateLimit(`probe:${ip}`, 60, 60_000);
+    const body = await readJson(req);
+    if (!Array.isArray(body.targets)) return json({ error: "targets must be an array" }, 400);
+    const allowed = new Set(peer.allowedGameTargets);
+    const list: { ip: string; port: number | null }[] = [];
+    for (const t of body.targets) {
+      const tip = str(t?.ip).trim();
+      const port = Number.isInteger(t?.port) && t.port >= 1 && t.port <= 65535 ? (t.port as number) : null;
+      if (allowed.has(tip) && !list.some((x) => x.ip === tip && x.port === port)) list.push({ ip: tip, port });
+    }
+    probes.watch(clientPub, list);
+    return json({ ok: true, watching: Math.min(list.length, 4) });
+  }
+
   if (path === "/api/state") {
     return json({
       auth: auth.uid ? `user:${auth.uid}` : "machine",
@@ -508,12 +535,14 @@ const cleanupTimer = setInterval(() => {
       if (now - Math.max(peer.lastSeen, handshake) <= STALE_MS) continue;
       await wg.removePeer(pub);
       peers.delete(pub);
+      probes.drop(pub);
       usedIps.delete(peer.ip);
       console.log(`[gpn-server] removed stale peer ${peer.name} (${peer.ip})`);
     }
   }).catch((e) => console.error("[gpn-server] peer cleanup failed:", e));
 }, 600_000);
 
+probes.start();
 DUMMY_HASH = await hashPassword(randomBytes(8).toString("hex"));
 await initDb();
 await restorePeers();
@@ -531,6 +560,7 @@ console.log(`[gpn-server] listening on :${cfg.port} (wg ${cfg.wgInterface}, ${cf
 
 async function shutdown() {
   clearInterval(cleanupTimer);
+  probes.stop();
   server.stop();
   await Promise.allSettled([pg.end(), redis.quit()]);
   process.exit(0);

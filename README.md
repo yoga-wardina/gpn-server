@@ -373,6 +373,10 @@ Behavior worth knowing:
 - Rate limits per client IP: register 5/hour, login 10/min, refresh 30/min, password change 10/min.
 - Request bodies are limited to 64 KB.
 - A peer with no API activity **and** no WireGuard handshake for 1 hour is removed automatically.
+- Latency probes (`/api/probe`) run only while a client keeps asking (they stop 45 s after the last request), one
+  probe per target every 2 s, over the last 30 samples. With a known port it's a TCP connect (works for hosts that
+  drop ICMP; a refused connection still counts as a reply); otherwise one ICMP echo through the system `ping`
+  (`apt install iputils-ping` if it's missing). Only IPs already registered on the caller's peer can be probed.
 - Game targets must be public IPv4 addresses (private, loopback, link-local, CGNAT, multicast and the
   server's own `publicEndpoint` are rejected).
 
@@ -393,6 +397,8 @@ All bodies are JSON. "Bearer" means `Authorization: Bearer <accessToken>` (or th
 | `GET /api/auth/me` | Bearer | current user |
 | `POST /api/register` | Bearer | `{publicKey, name}` → `{ip, serverPublicKey, endpoint, subnet}`; idempotent per key |
 | `POST /api/targets` | Bearer + `x-gpn-peer: <public key>` | `{targets:[{ip}]}` → `{routed, added, removed, rejected}` |
+| `POST /api/probe` | Bearer + `x-gpn-peer` | `{targets:[{ip, port?}]}` — start measuring latency/loss **from this server** to game servers already on your target list (max 4) |
+| `GET /api/probe` | Bearer + `x-gpn-peer` | latest results per target: `{ip, port, method, last, avg, min, max, jitter, lossPct, samples[]}` |
 | `GET /api/state` | Bearer | your peers (all peers for admins) |
 | `GET /api/admin/users` | admin | list users |
 | `POST /api/admin/users/status` | admin | `{userId, status:"active"\|"inactive"}` — inactive revokes tokens and removes that user's peers |
@@ -490,6 +496,8 @@ server config together; existing clients must re-register.
 | `ENOENT … /etc/wireguard/server.pub` on `/api/register` | Step 3 key files missing or the server isn't running as root. |
 | Clients get HTTP 429 | Per-IP rate limit hit; wait a minute. If *everyone* is limited, `X-Forwarded-For` isn't reaching the server (check the Caddy block), so all clients look like one IP. |
 | `peer limit reached (5)` | A user registered too many keys (e.g. reinstalled the client). Raise `maxPeersPerUser`, or remove stale peers with `wg set wg0 peer <KEY> remove && wg-quick save wg0`. |
+| Dashboard shows "update server" for the GPN → game leg | The server is older than the latency feature: deploy the new `probe.ts`/`main.ts` and restart. |
+| Probes to a game server always show 100% loss | The host drops both ICMP and TCP to that port from the VPS (some game servers firewall everything but the game's own protocol) — the game itself is unaffected. |
 | Tunnel connects (handshake OK) but no internet through it | `ip_forward` off, wrong `eth0` in the NAT rules, or ufw forward policy (Step 11). Check `iptables -t nat -S POSTROUTING` and `sysctl net.ipv4.ip_forward`. |
 | No handshake at all | UDP 51820 blocked (ufw **and** cloud firewall), wrong `publicEndpoint`, or the client's clock/key is wrong. `tcpdump -ni eth0 udp port 51820` while the client connects. |
 | Everyone was logged out after an update | Expected once when moving from the old token format; users sign in again. |
