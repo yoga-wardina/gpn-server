@@ -24,6 +24,7 @@ import { randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { loadConfig, type Config } from "./config.ts";
 import { WgManager, type Peer } from "./wireguard.ts";
 import { ProbeManager } from "./probe.ts";
+import { startDupRelay } from "./udpdup.ts";
 import { Pool } from "pg";
 import Redis from "ioredis";
 
@@ -51,6 +52,7 @@ redis.on("error", (e: Error) => console.error("[gpn-server] redis error:", e.mes
 
 const wg = new WgManager(cfg.wgInterface, cfg.wgSubnet);
 const peers = new Map<string, Peer>(); // publicKey -> Peer
+const dupEndpoint = () => (cfg.dupPort > 0 ? `${cfg.publicEndpoint}:${cfg.dupPort}` : null);
 const probes = new ProbeManager(); // latency/loss from this server to clients' game servers
 const usedIps = new Set<string>();
 
@@ -287,7 +289,7 @@ async function handle(req: Request, ip: string): Promise<Response> {
   const url = new URL(req.url);
   const path = url.pathname;
 
-  if (path === "/api/health") return json({ ok: true, ts: Date.now() });
+  if (path === "/api/health") return json({ ok: true, ts: Date.now(), dup: dupEndpoint() });
 
   // ---------- auth endpoints (public, rate limited) ----------
   if (path === "/api/auth/register" && req.method === "POST") {
@@ -445,6 +447,7 @@ async function handle(req: Request, ip: string): Promise<Response> {
       ip: peer.ip,
       serverPublicKey: serverPublicKey(),
       endpoint: `${cfg.publicEndpoint}:${cfg.wgPort}`,
+      dupEndpoint: dupEndpoint(),
       subnet: cfg.wgSubnet,
     });
   }
@@ -543,6 +546,8 @@ const cleanupTimer = setInterval(() => {
 }, 600_000);
 
 probes.start();
+const dupRelay = cfg.dupPort > 0 ? await startDupRelay({ listenPort: cfg.dupPort, targetPort: cfg.wgPort, delayMs: cfg.dupDelayMs }) : null;
+if (dupRelay) console.log(`[gpn-server] packet-duplication relay on udp/${cfg.dupPort} -> 127.0.0.1:${cfg.wgPort}`);
 DUMMY_HASH = await hashPassword(randomBytes(8).toString("hex"));
 await initDb();
 await restorePeers();
@@ -561,6 +566,7 @@ console.log(`[gpn-server] listening on :${cfg.port} (wg ${cfg.wgInterface}, ${cf
 async function shutdown() {
   clearInterval(cleanupTimer);
   probes.stop();
+  dupRelay?.stop();
   server.stop();
   await Promise.allSettled([pg.end(), redis.quit()]);
   process.exit(0);

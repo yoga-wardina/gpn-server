@@ -359,6 +359,8 @@ handshake and its game IPs in `allowed ips`.
 | `port` | `9090` | HTTP listen port (behind the reverse proxy). |
 | `wgInterface` | `wg0` | WireGuard interface name. |
 | `wgPort` | `51820` | WireGuard UDP port advertised to clients (must match `ListenPort`). |
+| `dupPort` | `0` (off) | UDP port of the **packet-duplication relay** (e.g. `51821`). Clients on a lossy link send each WireGuard packet twice to it; it forwards both to WireGuard (which drops the repeat) and sends replies back twice. Open it in the firewall: `ufw allow 51821/udp`. Also answers the client's UDP loss test. Changing it needs a restart. |
+| `dupDelayMs` | `3` | Gap between the two copies the relay sends back to a client (0–50 ms). |
 | `wgSubnet` | `10.66.0.0/24` | Client addresses are allocated as `.2`, `.3`, … (`.1` is the server). |
 | `maxTargets` | `64` | Max game IPs per peer. |
 | `maxPeersPerUser` | `5` | Max WireGuard peers a non-admin user may register. |
@@ -388,7 +390,7 @@ All bodies are JSON. "Bearer" means `Authorization: Bearer <accessToken>` (or th
 
 | Method & path | Auth | Description |
 |---|---|---|
-| `GET /api/health` | none | `{ok, ts}` |
+| `GET /api/health` | none | `{ok, ts, dup}` — `dup` is the relay's `host:port`, or `null` when `dupPort` is 0 |
 | `POST /api/auth/register` | none | `{username, password[, inviteCode]}` → `{user, accessToken, refreshToken}` |
 | `POST /api/auth/login` | none | `{username, password}` → `{user, accessToken, refreshToken}` |
 | `POST /api/auth/refresh` | none | `{refreshToken}` → new `{accessToken, refreshToken}` (old refresh token is consumed) |

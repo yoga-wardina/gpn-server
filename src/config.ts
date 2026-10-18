@@ -12,6 +12,10 @@ export interface Config {
   wgPort: number;
   /** Public endpoint clients should connect to (ip or hostname) — required */
   publicEndpoint?: string;
+  /** UDP port of the packet-duplication relay (clients on lossy links send each WireGuard packet twice). 0 = off. */
+  dupPort: number;
+  /** Gap between the two copies the relay sends to a client, in ms */
+  dupDelayMs: number;
   /** WG subnet clients are drawn from */
   wgSubnet: string;
   /** Max game targets a single peer may hold */
@@ -31,6 +35,8 @@ export const DEFAULT_CONFIG: Config = {
   port: 9090,
   wgInterface: "wg0",
   wgPort: 51820,
+  dupPort: 0,
+  dupDelayMs: 3,
   wgSubnet: "10.66.0.0/24",
   maxTargets: 64,
   maxPeersPerUser: 5,
