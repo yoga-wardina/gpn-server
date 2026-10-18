@@ -289,7 +289,7 @@ async function handle(req: Request, ip: string): Promise<Response> {
   const url = new URL(req.url);
   const path = url.pathname;
 
-  if (path === "/api/health") return json({ ok: true, ts: Date.now(), dup: dupEndpoint() });
+  if (path === "/api/health") return json({ ok: true, ts: Date.now(), dup: dupEndpoint(), dupStats: dupRelay ? (({ upPairs, upSingles }) => ({ upPairs, upSingles }))(dupRelay.stats()) : null });
 
   // ---------- auth endpoints (public, rate limited) ----------
   if (path === "/api/auth/register" && req.method === "POST") {

@@ -35,6 +35,9 @@ export interface DupStats {
   toClients: number;
   probes: number;
   dropped: number;
+  /** upstream packets that arrived with both copies / with only one (so the other was lost on the way) */
+  upPairs: number;
+  upSingles: number;
 }
 
 export interface DupRelay {
@@ -62,7 +65,26 @@ export async function startDupRelay(o: DupOptions): Promise<DupRelay> {
   const idleMs = o.idleMs ?? 180_000;
   const targetHost = o.targetHost ?? "127.0.0.1";
   const clients = new Map<string, Client>();
-  const st = { fromClients: 0, toClients: 0, probes: 0, dropped: 0 };
+  const st = { fromClients: 0, toClients: 0, probes: 0, dropped: 0, upPairs: 0, upSingles: 0 };
+  // fingerprints of recent upstream packets: a packet seen twice = both copies arrived, once = one was lost
+  const recent = new Map<string, { t: number; n: number }>();
+  const PAIR_WINDOW_MS = 300;
+  const note = (key: string, data: Uint8Array) => {
+    const k = `${key}/${Bun.hash(data)}`;
+    const e = recent.get(k);
+    if (e) e.n++;
+    else recent.set(k, { t: Date.now(), n: 1 });
+  };
+  const settle = () => {
+    const now = Date.now();
+    for (const [k, e] of recent) {
+      if (now - e.t < PAIR_WINDOW_MS) continue;
+      if (e.n >= 2) st.upPairs++;
+      else st.upSingles++;
+      recent.delete(k);
+    }
+  };
+  const settler = setInterval(settle, 150);
 
   const sendTwice = (sock: UdpSock, data: Uint8Array, port: number, addr: string) => {
     sock.send(data, port, addr);
@@ -107,10 +129,12 @@ export async function startDupRelay(o: DupOptions): Promise<DupRelay> {
             sock.send(data);
           }, () => clients.delete(key));
           st.fromClients++;
+          note(key, data);
           return;
         }
         c.last = Date.now();
         st.fromClients++;
+        note(key, data);
         if (c.up) c.up.send(data);
       },
     },
@@ -131,6 +155,7 @@ export async function startDupRelay(o: DupOptions): Promise<DupRelay> {
     stats: () => ({ clients: clients.size, ...st }),
     stop() {
       clearInterval(sweeper);
+      clearInterval(settler);
       for (const c of clients.values()) { try { c.up?.close(); } catch { /* ignore */ } }
       clients.clear();
       pub.close();

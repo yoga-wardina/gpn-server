@@ -64,3 +64,22 @@ test("duplicates both directions, echoes probes, ignores junk", async () => {
   relay.stop();
   wg.close();
 });
+
+test("counts upstream pairs and singles", async () => {
+  const wg = await Bun.udpSocket({ port: 0, hostname: "127.0.0.1", socket: { data() {} } });
+  const relay = await startDupRelay({ listenPort: 0, listenHost: "127.0.0.1", targetPort: wg.port, delayMs: 0 });
+  const client = await Bun.udpSocket({ port: 0, hostname: "127.0.0.1", socket: { data() {} } });
+  client.send(wgPacket(1), relay.port, "127.0.0.1"); // creates the client entry
+  await sleep(100);
+  for (const n of [10, 11, 12]) {
+    client.send(wgPacket(n), relay.port, "127.0.0.1");
+    if (n !== 12) client.send(wgPacket(n), relay.port, "127.0.0.1"); // 12 arrives once (its twin was "lost")
+  }
+  await sleep(600);
+  const st = relay.stats();
+  expect(st.upPairs).toBe(2);
+  expect(st.upSingles).toBe(2); // packet 1 (sent once) and 12
+  client.close();
+  relay.stop();
+  wg.close();
+});
