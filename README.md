@@ -25,6 +25,7 @@ VPS and sends only game traffic through it; this server
 2. [Step-by-step deployment](#2-step-by-step-deployment)
 3. [Configuration reference](#3-configuration-reference)
 4. [API reference](#4-api-reference)
+   - [4b. Packet-duplication relay (optional)](#4b-packet-duplication-relay-optional)
 5. [Operations](#5-operations)
 6. [Security notes](#6-security-notes)
 7. [Troubleshooting](#7-troubleshooting)
@@ -418,6 +419,107 @@ curl -s -X POST $BASE/api/admin/users/status -H "authorization: Bearer $TOKEN" \
 ```
 
 ---
+
+## 4b. Packet-duplication relay (optional)
+
+**What it is.** An extra UDP listener inside the existing `gpn-server` process (no second server, no new
+dependency). Clients on a lossy link send every WireGuard datagram to it **twice**; it forwards both copies to
+the local WireGuard port (`wgPort`), whose replay protection drops the repeat, and it sends WireGuard's replies
+back to the client twice. A packet is lost only if both copies are. It also echoes small `GPNP` probe packets so
+the desktop app can measure real UDP loss. It is **off unless `dupPort` is set**, and nothing else changes when
+it is off.
+
+```
+client WireGuard -> client proxy --(x2)--> VPS :dupPort (relay) --> 127.0.0.1:wgPort (WireGuard) --> NAT --> game
+                                   <--(x2)--
+```
+
+The relay only forwards datagrams that look like WireGuard messages (type byte 1-4, 32-2048 bytes) and
+probes (<= 64 bytes, echoed back at the same size, so no amplification). At most 256 client addresses at a time,
+idle ones dropped after 3 minutes.
+
+### Deploy (runbook for an automated agent)
+
+Assumptions: the server lives in `/opt/gpn-server`, runs as the systemd unit `gpn-server`, Bun is at
+`/root/.bun/bin/bun`, WireGuard listens on `51820` (the default `wgPort`), `ufw` is the firewall. Use another
+free UDP port than `51821` if it is taken; use the same number in every step.
+
+1. **Update the code** (from the `udp-dup` branch of this repo). Copy `src/` (including the new
+   `src/udpdup.ts`) and `test/` over `/opt/gpn-server`. Do **not** overwrite `server.config.json`.
+   There are no new dependencies, so `bun install` is not needed (running `bun install --production` is harmless).
+2. **Enable it in the config.** Edit `/opt/gpn-server/server.config.json` and add two keys to the top-level
+   object, keeping everything else:
+
+   ```json
+   "dupPort": 51821,
+   "dupDelayMs": 3
+   ```
+
+   Validate: `python3 -c "import json;json.load(open('/opt/gpn-server/server.config.json'))"` must print nothing.
+3. **Open the port.**
+
+   ```bash
+   ufw allow 51821/udp
+   ufw status | grep 51821
+   ```
+
+   If the VPS provider has a separate cloud firewall / security group, open **UDP 51821** inbound there as well
+   (the most common reason the client test reports "no reply").
+4. **Restart and check the log.**
+
+   ```bash
+   systemctl restart gpn-server
+   sleep 2
+   systemctl is-active gpn-server                      # -> active
+   journalctl -u gpn-server -n 30 --no-pager | grep "packet-duplication"
+   # -> [gpn-server] packet-duplication relay on udp/51821 -> 127.0.0.1:51820
+   ss -lunp | grep 51821                               # a bun process listens on 0.0.0.0:51821
+   ```
+
+5. **Check the public API advertises it.**
+
+   ```bash
+   curl -s https://<server-domain>/api/health          # -> {"ok":true,"ts":...,"dup":"<publicEndpoint>:51821"}
+   ```
+
+   `"dup":null` means `dupPort` was not read (wrong key / not restarted).
+6. **Check the relay answers probes** (from any machine with Python 3; replace the host):
+
+   ```bash
+   python3 - <<'EOF'
+   import socket
+   s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+   p = b"GPNP" + bytes(9)
+   s.sendto(p, ("<publicEndpoint>", 51821))
+   print("echo ok" if s.recvfrom(64)[0] == p else "bad echo")
+   EOF
+   ```
+
+   `socket.timeout` = the port is blocked (ufw / cloud firewall) or the service is not running.
+7. **Optional unit test on the server** (needs the dev files from step 1): `cd /opt/gpn-server && /root/.bun/bin/bun test test/udpdup.test.ts` -> `1 pass`.
+
+Done criteria: steps 4-6 all succeed. Existing peers, targets and the WireGuard port are unaffected.
+
+### Using it from the desktop app
+
+On the PC (app branch `udp-dup`): *Settings -> Packet loss protection -> Run test* reports UDP loss with one copy
+vs. two. If real loss shows up, tick **Enabled**; it applies the next time the tunnel starts. See the desktop
+README, section *Packet duplication*.
+
+### Roll back
+
+Remove `dupPort` and `dupDelayMs` from `server.config.json`, `systemctl restart gpn-server`, and optionally
+`ufw delete allow 51821/udp`. Clients that have duplication enabled then log that the server has no relay and use
+the normal endpoint on their next tunnel start.
+
+### Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| `/api/health` shows `"dup":null` | `dupPort` missing/0 in `server.config.json`, or the service was not restarted |
+| Probe echo times out | UDP port blocked by ufw or the provider's cloud firewall, or the port is already used (`ss -lunp`) |
+| Log: `EADDRINUSE` / failed to bind | Another process holds that UDP port; pick another `dupPort` |
+| Client tunnel never handshakes with duplication on | Wrong/closed relay port, or the proxy resolved an old IP: turn duplication off in the app and relaunch |
 
 ## 5. Operations
 
